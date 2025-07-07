@@ -1,0 +1,53 @@
+services:
+
+  db:
+    image: postgres:15
+    container_name: central_db
+    env_file: .env
+    environment:
+      POSTGRES_USER: apiuser
+      POSTGRES_PASSWORD: apipassword
+      POSTGRES_DB: telefonia
+    volumes:
+      - db_data:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5432:5432"
+    networks:
+      - central_network
+
+  extractor:
+    build:
+      context: ./extractor
+      args:
+        HTTP_PROXY: "http://proxymg.prodemge.gov.br:8080"
+        HTTPS_PROXY: "http://proxymg.prodemge.gov.br:8080"
+    container_name: central_extractor
+    env_file: .env
+    depends_on:
+      - db
+    command: ["./wait-for-db.sh", "db", "python", "extractor.py"]
+    networks:
+      - central_network
+
+  api:
+    build:
+      context: ./api
+      args:
+        HTTP_PROXY: "http://proxymg.prodemge.gov.br:8080"
+        HTTPS_PROXY: "http://proxymg.prodemge.gov.br:8080"
+    container_name: central_api
+    env_file: .env
+    ports:
+      - "8001:8000"
+    depends_on:
+      - db
+    networks:
+      - central_network
+
+volumes:
+  db_data:
+
+networks:
+  central_network:
+    driver: bridge

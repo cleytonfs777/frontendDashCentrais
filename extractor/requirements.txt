@@ -1,7 +1,0 @@
-python-dotenv
-sshtunnel
-sqlalchemy
-pandas
-apscheduler
-pymysql
-psycopg2-binary

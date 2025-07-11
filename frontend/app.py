@@ -4,18 +4,152 @@ from dash import dcc, html, Input, Output, State
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 import re
 import os
+import requests
+import json
+import threading
+import time as time_module
+
+# Cache global para os dados
+_cache_dados = {
+    'dataframe': None,
+    'timestamp': None,
+    'lock': threading.Lock()
+}
+
+# Configurações de cache (5 minutos)
+CACHE_TIMEOUT = 300  # segundos
+
+# Função para definir faixa horária
+def definir_faixa_horaria(hora):
+    if 0 <= hora < 2: return '00-02h'
+    elif 2 <= hora < 4: return '02-04h'
+    elif 4 <= hora < 6: return '04-06h'
+    elif 6 <= hora < 8: return '06-08h'
+    elif 8 <= hora < 10: return '08-10h'
+    elif 10 <= hora < 12: return '10-12h'
+    elif 12 <= hora < 14: return '12-14h'
+    elif 14 <= hora < 16: return '14-16h'
+    elif 16 <= hora < 18: return '16-18h'
+    elif 18 <= hora < 20: return '18-20h'
+    elif 20 <= hora < 22: return '20-22h'
+    else: return '22-24h'
+
+# Função para carregar dados da API com cache
+def carregar_dados_api():
+    """
+    Carrega dados da API CSV com cache inteligente de 5 minutos
+    """
+    global _cache_dados
+    
+    with _cache_dados['lock']:
+        # Verificar se temos cache válido
+        agora = time_module.time()
+        if (_cache_dados['dataframe'] is not None and 
+            _cache_dados['timestamp'] is not None and
+            (agora - _cache_dados['timestamp']) < CACHE_TIMEOUT):
+            
+            print(f"📋 Usando dados em cache (válido por {CACHE_TIMEOUT - int(agora - _cache_dados['timestamp'])}s)")
+            return _cache_dados['dataframe'].copy()
+    
+    # Cache expirado ou inexistente, buscar novos dados
+    API_URL = 'http://10.24.46.31:8001/api/export-csv'
+    JSON_PATH = 'dados.json'
+    
+    try:
+        # Tentar carregar da API CSV primeiro
+        print("🔄 Carregando dados da API CSV...")
+        inicio = time_module.time()
+        
+        response = requests.get(API_URL, timeout=60)
+        response.raise_for_status()
+        
+        # Carregar CSV diretamente do conteúdo da resposta
+        from io import StringIO
+        csv_content = StringIO(response.text)
+        df = pd.read_csv(csv_content)
+        
+        tempo_carregamento = time_module.time() - inicio
+        
+        # Converter colunas para os tipos corretos
+        if not df.empty:
+            # Converter cob para inteiro
+            if 'cob' in df.columns:
+                df['cob'] = pd.to_numeric(df['cob'], errors='coerce').astype('Int64')
+            
+            # Converter estado para inteiro
+            if 'estado' in df.columns:
+                df['estado'] = pd.to_numeric(df['estado'], errors='coerce').astype('Int64')
+            
+            # Converter duracao para numérico
+            if 'duracao' in df.columns:
+                df['duracao'] = pd.to_numeric(df['duracao'], errors='coerce')
+            
+            # Converter holdtime para numérico
+            if 'holdtime' in df.columns:
+                df['holdtime'] = pd.to_numeric(df['holdtime'], errors='coerce')
+            
+            # Converter fila para numérico se existir
+            if 'fila' in df.columns:
+                df['fila'] = pd.to_numeric(df['fila'], errors='coerce')
+        
+        # Atualizar cache
+        with _cache_dados['lock']:
+            _cache_dados['dataframe'] = df.copy()
+            _cache_dados['timestamp'] = time_module.time()
+        
+        print(f"✅ Dados CSV carregados da API: {len(df)} registros em {tempo_carregamento:.2f}s")
+        print(f"📊 Cache atualizado - válido por {CACHE_TIMEOUT}s")
+        return df
+        
+    except requests.exceptions.RequestException as e:
+        print(f"❌ Erro ao acessar API CSV: {e}")
+        
+        # Tentar usar cache expirado se disponível
+        if _cache_dados['dataframe'] is not None:
+            print("🔄 Usando cache expirado como fallback")
+            return _cache_dados['dataframe'].copy()
+        
+        # Fallback para arquivo JSON
+        if os.path.exists(JSON_PATH):
+            try:
+                with open(JSON_PATH, 'r', encoding='utf-8') as f:
+                    df = pd.read_json(f)
+                print(f"📁 Dados carregados do arquivo JSON (fallback): {len(df)} registros")
+                return df
+            except Exception as e:
+                print(f"❌ Erro ao carregar arquivo JSON: {e}")
+        
+        # Se tudo falhar, retorna DataFrame vazio
+        print("⚠️ Retornando DataFrame vazio")
+        return pd.DataFrame()
+    
+    except Exception as e:
+        print(f"❌ Erro inesperado ao processar CSV: {e}")
+        
+        # Tentar usar cache expirado se disponível
+        if _cache_dados['dataframe'] is not None:
+            print("🔄 Usando cache expirado como fallback")
+            return _cache_dados['dataframe'].copy()
+        
+        # Fallback para arquivo JSON
+        if os.path.exists(JSON_PATH):
+            try:
+                with open(JSON_PATH, 'r', encoding='utf-8') as f:
+                    df = pd.read_json(f)
+                print(f"📁 Dados carregados do arquivo JSON (fallback): {len(df)} registros")
+                return df
+            except Exception as e:
+                print(f"❌ Erro ao carregar arquivo JSON: {e}")
+        
+        # Se tudo falhar, retorna DataFrame vazio
+        print("⚠️ Retornando DataFrame vazio")
+        return pd.DataFrame()
 
 # Carregar dados
-# Carregar dados adicionais de JSON, se existir
-JSON_PATH = 'dados.json'
-if os.path.exists(JSON_PATH):
-    with open(JSON_PATH, 'r', encoding='utf-8') as f:
-        df = pd.read_json(f)
-else:
-    df = pd.DataFrame()
+df = carregar_dados_api()
 
 # Dicionário para mapear os valores de COB para os nomes das regiões
 cob_legend = {
@@ -30,8 +164,16 @@ cob_legend = {
 }
 
 # Preprocessamento para performance
-unique_cob_values = df['cob'].sort_values().unique()
-unique_destinos = [{'label': cob_legend.get(cob, f'COB {cob}'), 'value': cob} for cob in unique_cob_values if cob in cob_legend]
+if not df.empty and 'cob' in df.columns:
+    # Remover valores nulos e obter valores únicos
+    unique_cob_values = df['cob'].dropna().sort_values().unique()
+    unique_destinos = [{'label': cob_legend.get(cob, f'COB {cob}'), 'value': cob} 
+                      for cob in unique_cob_values if cob in cob_legend]
+    print(f"🎯 COBs encontrados: {list(unique_cob_values)}")
+    print(f"🎯 COBs mapeados: {[item['value'] for item in unique_destinos]}")
+else:
+    unique_destinos = []
+    print("⚠️ Nenhum COB encontrado nos dados")
 
 # Converter coluna 'data' para datetime se não estiver vazia
 if not df.empty and 'data' in df.columns:
@@ -43,20 +185,6 @@ if not df.empty and 'data' in df.columns:
     
     # Criar coluna de faixa horária
     df['hora_int'] = pd.to_datetime(df['hora'], format='%H:%M:%S').dt.hour
-    def definir_faixa_horaria(hora):
-        if 0 <= hora < 2: return '00-02h'
-        elif 2 <= hora < 4: return '02-04h'
-        elif 4 <= hora < 6: return '04-06h'
-        elif 6 <= hora < 8: return '06-08h'
-        elif 8 <= hora < 10: return '08-10h'
-        elif 10 <= hora < 12: return '10-12h'
-        elif 12 <= hora < 14: return '12-14h'
-        elif 14 <= hora < 16: return '14-16h'
-        elif 16 <= hora < 18: return '16-18h'
-        elif 18 <= hora < 20: return '18-20h'
-        elif 20 <= hora < 22: return '20-22h'
-        else: return '22-24h'
-    
     df['faixa_horaria'] = df['hora_int'].apply(definir_faixa_horaria)
     
     # Mapear estado para status legível
@@ -64,11 +192,14 @@ if not df.empty and 'data' in df.columns:
     
     min_date = df['data'].min().date()
     max_date = df['data'].max().date()
+    print(f"📅 Período dos dados: {min_date} até {max_date}")
+    print(f"📊 Dados processados: {len(df)} registros com COB mapeados")
 else:
     # Valores padrão caso não haja dados
     from datetime import date
     min_date = date.today()
     max_date = date.today()
+    print("⚠️ Usando datas padrão (hoje)")
 
 # App Dash
 app = dash.Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP])
@@ -201,20 +332,24 @@ filtros2 = dbc.Row([
 #     dbc.Col(dcc.Graph(id='grafico-comparativo-tipo-dia', className='my-2'), xs=12, md=6, className='my-2'),
 # ], className='mb-4')
 
-# Indicadores principais
+# Indicadores principais com status da API
 indicadores = dbc.Row([
     dbc.Col(dbc.Card([dbc.CardBody([
         html.H6('Total de Ligações', className='card-title'),
         html.H2(id='total-ligacoes', className='card-text')
-    ])]), xs=12, md=4, className='my-2'),
+    ])]), xs=12, md=3, className='my-2'),
     dbc.Col(dbc.Card([dbc.CardBody([
         html.H6('Atendidas', className='card-title'),
         html.H2(id='total-atendidas', className='card-text')
-    ])]), xs=12, md=4, className='my-2'),
+    ])]), xs=12, md=3, className='my-2'),
     dbc.Col(dbc.Card([dbc.CardBody([
         html.H6('Não Atendidas', className='card-title'),
         html.H2(id='total-nao-atendidas', className='card-text')
-    ])]), xs=12, md=4, className='my-2'),
+    ])]), xs=12, md=3, className='my-2'),
+    dbc.Col(dbc.Card([dbc.CardBody([
+        html.H6('Status dos Dados', className='card-title'),
+        html.Div(id='status-api', className='card-text')
+    ])]), xs=12, md=3, className='my-2'),
 ], className='mb-3')
 
 # Indicadores avançados
@@ -281,21 +416,55 @@ graficos5 = dbc.Row([
 
 # Layout
 app.layout = dbc.Container([
-    filtros,
-    filtros2,
-    indicadores,
-    indicadores_avancados,
-    indicadores_por_cob,
-    graficos,
-    graficos2,
-    graficos3,
-    graficos4,
-    graficos5,
-    html.Footer([
-        html.Hr(),
+        filtros,
+        filtros2,
+        indicadores,
+        indicadores_avancados,
+        indicadores_por_cob,
+        graficos,
+        graficos2,
+        graficos3,
+        graficos4,
+        graficos5,
+        html.Footer([
+            html.Hr(),
         html.P('Desenvolvido para o Corpo de Bombeiros Militar de Minas Gerais', style={'textAlign': 'center', 'color': '#fff'})
     ], className='footer')
 ], fluid=True, id='main-container')
+
+# Função para obter status dos dados
+def obter_status_dados():
+    """
+    Retorna o status atual dos dados (API, Cache, JSON local)
+    """
+    global _cache_dados
+    
+    if _cache_dados['timestamp'] is None:
+        return html.Span([
+            html.I(className="fas fa-circle", style={'color': 'gray', 'marginRight': '5px'}),
+            "Sem dados"
+        ], style={'fontSize': '14px'})
+    
+    agora = time_module.time()
+    tempo_desde_update = agora - _cache_dados['timestamp']
+    
+    if tempo_desde_update < CACHE_TIMEOUT:
+        # Cache válido
+        minutos_restantes = (CACHE_TIMEOUT - tempo_desde_update) / 60
+        return html.Span([
+            html.I(className="fas fa-circle", style={'color': 'green', 'marginRight': '5px'}),
+            f"Dados atuais",
+            html.Br(),
+            html.Small(f"Próxima atualização em {minutos_restantes:.1f}min", style={'color': 'gray'})
+        ], style={'fontSize': '14px'})
+    else:
+        # Cache expirado
+        return html.Span([
+            html.I(className="fas fa-circle", style={'color': 'orange', 'marginRight': '5px'}),
+            "Cache expirado",
+            html.Br(),
+            html.Small("Clique para atualizar", style={'color': 'gray'})
+        ], style={'fontSize': '14px'})
 
 # Função para converter segundos em formato legível
 def segundos_legiveis(segundos):
@@ -316,6 +485,7 @@ def segundos_legiveis(segundos):
         Output('total-ligacoes', 'children'),
         Output('total-atendidas', 'children'),
         Output('total-nao-atendidas', 'children'),
+        Output('status-api', 'children'),
         Output('taxa-atendimento', 'children'),
         Output('duracao-media', 'children'),
         Output('tempo-espera-medio', 'children'),
@@ -341,6 +511,41 @@ def segundos_legiveis(segundos):
     ]
 )
 def atualizar_dashboard(date_ini, hh_ini, mm_ini, date_fim, hh_fim, mm_fim, destinos, mostrar_legenda):
+    # Usar dados em cache (não recarregar a cada interação)
+    df_atual = carregar_dados_api()
+    
+    # Obter status dos dados
+    status_texto = obter_status_dados()
+    
+    if df_atual is None or df_atual.empty:
+        print("Dados não encontrados ou vazios")
+        return [
+            0, 0, 0, status_texto, "0%", "0 min", "0 min", [], 
+            {}, {}, {}, {}, {}, {}, {}, {}
+        ]
+    
+    # Processar dados se não estiver vazio
+    if not df_atual.empty and 'data' in df_atual.columns:
+        # Converter coluna 'data' para datetime (apenas se não já processado)
+        if df_atual['data'].dtype == 'object':
+            df_atual['data'] = pd.to_datetime(df_atual['data'])
+        
+        # Criar colunas derivadas apenas se não existirem
+        if 'datetime' not in df_atual.columns:
+            df_atual['datetime'] = pd.to_datetime(df_atual['data'].dt.strftime('%Y-%m-%d') + ' ' + df_atual['hora'].astype(str))
+        
+        if 'cob_nome' not in df_atual.columns:
+            df_atual['cob_nome'] = df_atual['cob'].map(cob_legend)
+        
+        if 'hora_int' not in df_atual.columns:
+            df_atual['hora_int'] = pd.to_datetime(df_atual['hora'], format='%H:%M:%S').dt.hour
+        
+        if 'faixa_horaria' not in df_atual.columns:
+            df_atual['faixa_horaria'] = df_atual['hora_int'].apply(definir_faixa_horaria)
+        
+        if 'status' not in df_atual.columns:
+            df_atual['status'] = df_atual['estado'].map({0: 'Não Atendido', 1: 'Atendido'})
+    
     # Validação dos campos de hora/minuto
     try:
         hh_ini = int(hh_ini)
@@ -372,15 +577,15 @@ def atualizar_dashboard(date_ini, hh_ini, mm_ini, date_fim, hh_fim, mm_fim, dest
     try:
         datahora_ini = datetime.strptime(f"{date_ini} {hora_ini}", "%Y-%m-%d %H:%M")
     except:
-        datahora_ini = df['datetime'].min() if not df.empty else datetime.now()
+        datahora_ini = df_atual['datetime'].min() if not df_atual.empty else datetime.now()
     try:
         datahora_fim = datetime.strptime(f"{date_fim} {hora_fim}", "%Y-%m-%d %H:%M")
     except:
-        datahora_fim = df['datetime'].max() if not df.empty else datetime.now()
+        datahora_fim = df_atual['datetime'].max() if not df_atual.empty else datetime.now()
 
     # Filtrar dados
-    if not df.empty:
-        dff = df[(df['datetime'] >= datahora_ini) & (df['datetime'] <= datahora_fim)]
+    if not df_atual.empty:
+        dff = df_atual[(df_atual['datetime'] >= datahora_ini) & (df_atual['datetime'] <= datahora_fim)]
         if destinos:
             dff = dff[dff['cob'].isin(destinos)]
     else:
@@ -783,6 +988,7 @@ def atualizar_dashboard(date_ini, hh_ini, mm_ini, date_fim, hh_fim, mm_fim, dest
 
     return (
         total_ligacoes_str, total_atendidas_str, total_nao_atendidas_str,
+        status_texto,
         taxa_atendimento_str, duracao_media_str, tempo_espera_medio_str,
         indicadores_cob_layout,
         fig_chamadas, fig_atendidas, fig_faixa, fig_linha_faixa, 

@@ -1,51 +1,111 @@
-# Dashboard Central Telefônica
+# Dashboard Central Telefônica - CBMMG
 
-Dashboard interativo para análise de dados de central telefônica do Corpo de Bombeiros Militar de Minas Gerais.
+Dashboard para monitoramento de ligações do Corpo de Bombeiros Militar de Minas Gerais.
 
-## Funcionalidades
+## 🚀 Como executar com Docker
 
-- Visualização de métricas principais (total de ligações, atendidas, não atendidas)
-- Indicadores avançados (taxa de atendimento, duração média, tempo total por dia)
-- Gráficos interativos:
-  - Linha: ligações por dia
-  - Barras: ligações por faixa horária  
-  - Heatmap: hora x dia da semana
-  - Pizza: dias úteis vs fim de semana
-- Filtros por data e fila de atendimento
+### Pré-requisitos
+- Docker
+- Docker Compose
 
-## Requisitos
+### Executar a aplicação
 
-- Python 3.7+
-- Arquivo `dados.json` na raiz do projeto
+1. **Clonar/baixar o projeto**
+   ```bash
+   # Se usando git
+   git clone <url-do-repositorio>
+   cd dashcentraltelefonica
+   ```
 
-## Instalação
+2. **Construir e executar com Docker Compose**
+   ```bash
+   docker-compose up --build
+   ```
 
-1. Instale as dependências:
-```bash
-pip install -r requirements.txt
+3. **Acessar a aplicação**
+   ```
+   http://localhost:8050
+   ```
+
+### Comandos úteis
+
+- **Parar a aplicação:**
+  ```bash
+  docker-compose down
+  ```
+
+- **Executar em background:**
+  ```bash
+  docker-compose up -d --build
+  ```
+
+- **Ver logs:**
+  ```bash
+  docker-compose logs -f dashboard-frontend
+  ```
+
+- **Reconstruir apenas a imagem:**
+  ```bash
+  docker-compose build --no-cache
+  ```
+
+## 📁 Estrutura do projeto
+
+```
+├── docker-compose.yml          # Configuração do Docker Compose
+├── frontend/                   # Aplicação Dash
+│   ├── Dockerfile             # Configuração do container
+│   ├── app.py                 # Aplicação principal
+│   ├── dados.json             # Dados das ligações
+│   ├── requirements.txt       # Dependências Python
+│   └── assets/                # Arquivos estáticos
+│       ├── bombeiro.png       # Logo
+│       └── *.css             # Estilos CSS
+└── README.md                  # Este arquivo
 ```
 
-2. Execute o dashboard:
-```bash
-python app.py
-```
+## 🔧 Desenvolvimento
 
-3. Acesse no navegador: http://127.0.0.1:8050
+Para desenvolvimento local sem Docker:
 
-## Estrutura do Projeto
+1. **Instalar dependências:**
+   ```bash
+   cd frontend
+   pip install -r requirements.txt
+   ```
 
-```
-├── app.py                 # Aplicação principal
-├── dados.json            # Dados da central telefônica
-├── requirements.txt      # Dependências Python
-├── assets/
-│   └── style.css        # Estilos CSS customizados
-└── README.md            # Documentação
-```
+2. **Executar aplicação:**
+   ```bash
+   python app.py
+   ```
 
-## Cores e Tema
+## 📊 Funcionalidades
 
-- Fundo principal: #162447 (azul escuro)
-- Cards: branco com bordas arredondadas
-- Títulos: #c04f03 (laranja)
-- Gráficos: #a84105 (laranja) e #162447 (azul escuro)
+- **Indicadores Gerais:** Total de ligações, atendidas, não atendidas
+- **Indicadores Avançados:** Taxa de atendimento, duração média, tempo de espera
+- **Indicadores por COB:** Comparação entre regiões
+- **Gráficos Interativos:** 
+  - Quantidade de chamadas por data e COB
+  - Atendidas vs Não atendidas por região
+  - Distribuição por faixa horária
+  - Gráfico pizza de distribuição
+  - Top atendente e top COB
+
+## 🎯 COBs Monitorados
+
+- 2ºCOB - Uberlândia
+- 2ºCOB - Uberaba  
+- 3ºCOB - Juiz de Fora
+- 3ºCOB - Barbacena
+- 4ºCOB - Montes Claros
+- 5ºCOB - Governador Valadares
+- 5ºCOB - Ipatinga
+- 6ºCOB - Varginha
+
+## 🔄 Atualizações
+
+Para atualizar dados ou fazer modificações:
+
+1. Edite os arquivos necessários
+2. Reconstrua a imagem: `docker-compose build --no-cache`
+3. Reinicie: `docker-compose up -d`

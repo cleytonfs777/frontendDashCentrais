@@ -12,6 +12,7 @@ services:
       - http_proxy=http://proxymg.prodemge.gov.br:8080
       - https_proxy=http://proxymg.prodemge.gov.br:8080
     volumes:
+      - ./data:/app/data
       - ./frontend/dados.json:/app/dados.json
     restart: unless-stopped
     networks:

@@ -1,7 +1,7 @@
 services:
   dashboard-frontend:
     build:
-      context: ./frontend
+      context: ./sistema
       dockerfile: Dockerfile
     container_name: cbmmg-dashboard-frontend
     ports:
@@ -12,8 +12,7 @@ services:
       - http_proxy=http://proxymg.prodemge.gov.br:8080
       - https_proxy=http://proxymg.prodemge.gov.br:8080
     volumes:
-      - ./data:/app/data
-      - ./frontend/dados.json:/app/dados.json
+      - ./sistema/data:/app/data
     restart: unless-stopped
     networks:
       - dashboard-network

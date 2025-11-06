@@ -7,30 +7,23 @@ import plotly.graph_objects as go
 from datetime import datetime, time, timedelta
 import re
 import os
-import requests
-import json
 import threading
-import time as time_module
 import sqlite3
 from contextlib import contextmanager
-import schedule
 from threading import Thread
 
-# Configurações do banco de dados
+
+# Configurações do banco de dados e arquivo CSV
 DB_PATH = 'data/dados_chamadas.db'
-API_BASE_URL = 'http://10.24.46.31:8001/api/export-csv'
+CSV_PATH = 'data/geral_df.csv'
 
 # Cache global para os dados
 _cache_dados = {
     'dataframe': None,
-    'timestamp': None,
-    'lock': threading.Lock(),
-    'last_sync': None
+    'lock': threading.Lock()
 }
 
-# Configurações de sincronização
-SYNC_INTERVAL_MINUTES = 5  # Atualizar a cada 5 minutos
-CACHE_TIMEOUT = 300  # 5 minutos em segundos
+# Flag de carga inicial
 INITIAL_LOAD_COMPLETE = False
 
 # Função para definir faixa horária
@@ -68,18 +61,12 @@ def init_database():
                 hora TEXT NOT NULL,
                 duracao REAL,
                 fila TEXT,
-                holdtime REAL,
                 teleatendente TEXT,
                 estado INTEGER,
                 cob INTEGER,
-                datetime TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(data, hora, duracao, fila, holdtime, teleatendente, estado, cob)
+                UNIQUE(data, hora, duracao, fila, teleatendente, estado, cob)
             )
-        ''')
-        
-        conn.execute('''
-            CREATE INDEX IF NOT EXISTS idx_datetime ON chamadas(datetime)
         ''')
         
         conn.execute('''
@@ -105,21 +92,12 @@ def init_database():
         conn.commit()
         print("✅ Banco de dados inicializado")
 
-def salvar_dados_banco(df, sync_type="manual"):
+
+def salvar_dados_banco(df, origem="csv"):
     """Salva dados no banco, evitando duplicatas"""
     if df.empty:
         print("⚠️ DataFrame vazio, nada para salvar")
         return 0
-    
-    # Criar coluna datetime se não existir
-    if 'datetime' not in df.columns:
-        try:
-            df['datetime'] = pd.to_datetime(df['data'] + ' ' + df['hora'], errors='coerce').dt.strftime('%Y-%m-%d %H:%M:%S')
-            # Remover linhas com datetime inválido
-            df = df.dropna(subset=['datetime'])
-        except Exception as e:
-            print(f"❌ Erro ao criar coluna datetime: {e}")
-            return 0
     
     records_added = 0
     
@@ -130,12 +108,11 @@ def salvar_dados_banco(df, sync_type="manual"):
             try:
                 cursor.execute('''
                     INSERT OR IGNORE INTO chamadas 
-                    (data, hora, duracao, fila, holdtime, teleatendente, estado, cob, datetime)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (data, hora, duracao, fila, teleatendente, estado, cob)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
                 ''', (
-                    row['data'], row['hora'], row.get('duracao'), row.get('fila'),
-                    row.get('holdtime'), row.get('teleatendente'), row.get('estado'),
-                    row.get('cob'), row['datetime']
+                    row['data'], row['hora'], row.get('duracao', 0), row.get('fila', ''),
+                    row.get('teleatendente', ''), row.get('estado', 0), row.get('cob', 0)
                 ))
                 
                 if cursor.rowcount > 0:
@@ -145,15 +122,15 @@ def salvar_dados_banco(df, sync_type="manual"):
                 print(f"❌ Erro ao inserir registro: {e}")
                 continue
         
-        # Log da sincronização
-        cursor.execute('''
-            INSERT INTO sync_log (sync_type, url, records_added, status, details)
-            VALUES (?, ?, ?, ?, ?)
-        ''', (sync_type, API_BASE_URL, records_added, "success", f"Processados {len(df)} registros"))
+        # Log da carga
+        # cursor.execute('''
+        #     INSERT INTO sync_log (arquivo, records_total, records_added, status, details)
+        #     VALUES (?, ?, ?, ?, ?)
+        # ''', (origem, len(df), records_added, "success", f"Processados {len(df)} registros"))
         
         conn.commit()
     
-    print(f"💾 Salvos {records_added} novos registros no banco")
+    print(f"💾 Salvos {records_added} novos registros no banco (de {len(df)} processados)")
     return records_added
 
 def carregar_dados_banco():
@@ -161,23 +138,21 @@ def carregar_dados_banco():
     try:
         with get_db_connection() as conn:
             df = pd.read_sql_query('''
-                SELECT data, hora, duracao, fila, holdtime, teleatendente, estado, cob, datetime
+                SELECT data, hora, duracao, fila, teleatendente, estado, cob
                 FROM chamadas 
-                ORDER BY datetime DESC
+                ORDER BY data DESC, hora DESC
             ''', conn)
         
         if not df.empty:
             # Converter tipos de forma mais robusta
             df['data'] = pd.to_datetime(df['data'], errors='coerce')
-            df['datetime'] = pd.to_datetime(df['datetime'], errors='coerce')
             
-            # Remover linhas com datetime inválido
-            df = df.dropna(subset=['datetime'])
+            # Remover linhas com data inválida
+            df = df.dropna(subset=['data'])
             
             df['estado'] = df['estado'].astype('Int64')
             df['cob'] = df['cob'].astype('Int64')
-            df['duracao'] = pd.to_numeric(df['duracao'], errors='coerce')
-            df['holdtime'] = pd.to_numeric(df['holdtime'], errors='coerce')
+            df['duracao'] = pd.to_numeric(df['duracao'], errors='coerce').fillna(0)
             
             print(f"📊 Carregados {len(df)} registros do banco")
         
@@ -187,138 +162,125 @@ def carregar_dados_banco():
         print(f"❌ Erro ao carregar dados do banco: {e}")
         return pd.DataFrame()
 
-def baixar_csv_completo():
-    """Baixa o CSV completo da API e salva no banco"""
-    global INITIAL_LOAD_COMPLETE
+
+def carregar_csv_para_banco():
+    """Carrega o CSV completo e salva no banco (executa apenas uma vez)"""
+    global INITIAL_LOAD_COMPLETE, _cache_dados
     
-    print("🔄 Iniciando download do CSV completo...")
+    print("🔄 Iniciando carga do CSV para o banco...")
     
     try:
-        response = requests.get(API_BASE_URL, timeout=120)
-        response.raise_for_status()
+        if not os.path.exists(CSV_PATH):
+            print(f"❌ Arquivo {CSV_PATH} não encontrado")
+            return
         
-        from io import StringIO
-        csv_content = StringIO(response.text)
-        df = pd.read_csv(csv_content)
+        # Verificar se já existe dados no banco
+        with get_db_connection() as conn:
+            cursor = conn.execute("SELECT COUNT(*) FROM chamadas")
+            count = cursor.fetchone()[0]
+            
+            if count > 0:
+                print(f"✅ Banco já possui {count} registros, pulando carga do CSV")
+                INITIAL_LOAD_COMPLETE = True
+                
+                # Carregar dados do banco para o cache
+                df = carregar_dados_banco()
+                if not df.empty:
+                    _cache_dados['dataframe'] = df.copy()
+                return
         
-        if not df.empty:
-            records_added = salvar_dados_banco(df, "initial_full")
-            print(f"✅ CSV completo baixado: {len(df)} registros, {records_added} novos")
-            INITIAL_LOAD_COMPLETE = True
-            
-            # Atualizar cache
-            _cache_dados['dataframe'] = df.copy()
-            _cache_dados['timestamp'] = time_module.time()
-            _cache_dados['last_sync'] = datetime.now()
-            
-            return df
-        else:
-            print("⚠️ CSV completo está vazio")
-            return pd.DataFrame()
-            
+        # Ler o CSV
+        print(f"📖 Lendo arquivo CSV: {CSV_PATH}")
+        df = pd.read_csv(CSV_PATH)
+        
+        if df.empty:
+            print("⚠️ CSV está vazio")
+            return
+        
+        # Validar colunas necessárias
+        colunas_necessarias = ['data', 'hora', 'duracao', 'fila', 'teleatendente', 'estado', 'cob']
+        colunas_faltantes = [col for col in colunas_necessarias if col not in df.columns]
+        
+        if colunas_faltantes:
+            print(f"❌ Colunas faltantes no CSV: {colunas_faltantes}")
+            return
+        
+        # Limpar e preparar dados
+        print("🧹 Limpando e preparando dados...")
+        
+        # Remover linhas com valores nulos em colunas críticas
+        df = df.dropna(subset=['data', 'hora'])
+        
+        # Converter tipos de dados
+        df['data'] = pd.to_datetime(df['data'], errors='coerce').dt.strftime('%Y-%m-%d')
+        df = df.dropna(subset=['data'])  # Remover datas inválidas
+        
+        # Garantir que hora está no formato string
+        df['hora'] = df['hora'].astype(str)
+        
+        # Converter duracao para float
+        df['duracao'] = pd.to_numeric(df['duracao'], errors='coerce').fillna(0)
+        
+        # Converter estado e cob para inteiro
+        df['estado'] = pd.to_numeric(df['estado'], errors='coerce').fillna(0).astype(int)
+        df['cob'] = pd.to_numeric(df['cob'], errors='coerce').fillna(0).astype(int)
+        
+        # Garantir que fila e teleatendente são strings
+        df['fila'] = df['fila'].astype(str).fillna('')
+        df['teleatendente'] = df['teleatendente'].astype(str).fillna('')
+        
+        print(f"📝 Dados preparados: {len(df)} registros válidos")
+        
+        # Salvar no banco
+        records_added = salvar_dados_banco(df, CSV_PATH)
+        
+        print(f"✅ Carga do CSV concluída: {records_added} registros adicionados ao banco")
+        
+        INITIAL_LOAD_COMPLETE = True
+        
+        # Atualizar cache
+        _cache_dados['dataframe'] = df.copy()
+        
     except Exception as e:
-        print(f"❌ Erro ao baixar CSV completo: {e}")
-        return pd.DataFrame()
-
-def sincronizar_ano_atual():
-    """Sincroniza dados do ano atual"""
-    ano_atual = datetime.now().year
-    url_ano = f"{API_BASE_URL}/{ano_atual}"
+        print(f"❌ Erro ao carregar CSV para o banco: {e}")
+        import traceback
+        traceback.print_exc()
     
-    print(f"🔄 Sincronizando dados de {ano_atual}...")
-    
-    try:
-        response = requests.get(url_ano, timeout=60)
-        response.raise_for_status()
-        
-        from io import StringIO
-        csv_content = StringIO(response.text)
-        df = pd.read_csv(csv_content)
-        
-        if not df.empty:
-            records_added = salvar_dados_banco(df, f"sync_{ano_atual}")
-            print(f"✅ Sincronização {ano_atual}: {len(df)} registros, {records_added} novos")
-            
-            # Atualizar cache apenas se há novos dados
-            if records_added > 0:
-                df_banco = carregar_dados_banco()
-                _cache_dados['dataframe'] = df_banco.copy()
-                _cache_dados['timestamp'] = time_module.time()
-            
-            _cache_dados['last_sync'] = datetime.now()
-            
-        else:
-            print(f"⚠️ Nenhum dado para {ano_atual}")
-            
-    except Exception as e:
-        print(f"❌ Erro na sincronização {ano_atual}: {e}")
 
-def job_sincronizacao():
-    """Job que roda periodicamente para sincronizar dados"""
-    if INITIAL_LOAD_COMPLETE:
-        sincronizar_ano_atual()
-    else:
-        print("⏳ Aguardando carga inicial completar...")
-
-def iniciar_scheduler():
-    """Inicia o scheduler em background"""
-    def run_scheduler():
-        schedule.every(SYNC_INTERVAL_MINUTES).minutes.do(job_sincronizacao)
-        
-        while True:
-            schedule.run_pending()
-            time_module.sleep(60)  # Verificar a cada minuto
-    
-    scheduler_thread = Thread(target=run_scheduler, daemon=True)
-    scheduler_thread.start()
-    print(f"⏰ Scheduler iniciado - sincronização a cada {SYNC_INTERVAL_MINUTES} minutos")
-
-def carregar_dados_api():
-    """
-    Função principal para carregar dados
-    1. Na primeira execução: baixa CSV completo
-    2. Depois: usa dados do banco e sincroniza periodicamente
-    """
-    global _cache_dados, INITIAL_LOAD_COMPLETE
+def carregar_dados():
+    """Função principal para carregar dados (do cache ou do banco)"""
+    global _cache_dados
     
     with _cache_dados['lock']:
-        # Se já temos dados em cache válidos, usar
-        if (_cache_dados['dataframe'] is not None and 
-            _cache_dados['timestamp'] is not None and
-            (time_module.time() - _cache_dados['timestamp']) < 300):  # 5 minutos
-            
-            print(f"📋 Usando dados em cache")
+        # Se já temos dados em cache, usar
+        if _cache_dados['dataframe'] is not None:
+            print("✅ Usando dados em cache")
             return _cache_dados['dataframe'].copy()
         
-        # Se não é a primeira vez, carregar do banco
-        if INITIAL_LOAD_COMPLETE:
-            df = carregar_dados_banco()
-            if not df.empty:
-                _cache_dados['dataframe'] = df.copy()
-                _cache_dados['timestamp'] = time_module.time()
-                return df
-        
-        # Primeira execução ou banco vazio - baixar CSV completo
-        if not INITIAL_LOAD_COMPLETE:
-            df = baixar_csv_completo()
-            if not df.empty:
-                return df
-        
-        # Fallback: tentar carregar do banco mesmo sem carga inicial
+        # Carregar do banco
+        print("📊 Carregando dados do banco...")
         df = carregar_dados_banco()
+        
         if not df.empty:
             _cache_dados['dataframe'] = df.copy()
-            _cache_dados['timestamp'] = time_module.time()
             return df
         
-        print("⚠️ Nenhum dado disponível")
         return pd.DataFrame()
 
-# Carregar dados
-df = carregar_dados_api()
+# Inicialização do banco de dados
+print("🚀 Inicializando aplicação...")
+init_database()
+
+# Carregar CSV para o banco (sincronamente) na inicialização para garantir que
+# as datas mínimas/máximas e opções dos filtros sejam definidas corretamente.
+carregar_csv_para_banco()
+
+# Carregar dados iniciais
+df = carregar_dados()
 
 # Dicionário para mapear os valores de COB para os nomes das regiões
 cob_legend = {
+    11: '1ºCOB - Divinópolis',
     21: '2ºCOB - Uberlândia',
     22: '2ºCOB - Uberaba',
     31: '3ºCOB - Juiz de Fora',
@@ -358,13 +320,6 @@ else:
 # App Dash
 app = dash.Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP])
 
-# Inicialização do banco de dados e scheduler
-print("🚀 Inicializando aplicação...")
-init_database()
-iniciar_scheduler()
-
-# Fazer carga inicial em background
-Thread(target=baixar_csv_completo, daemon=True).start()
 app.title = 'Painel de Monitoramento de Ligações - CBMMG'
 
 # Logotipo
@@ -447,60 +402,8 @@ filtros2 = dbc.Row([
             placeholder='Filtrar por Destino',
             style={'width': '100%', 'marginTop': 24}
         )
-    ], xs=12, md=3, className='my-2'),
-    dbc.Col([
-        dcc.Dropdown(
-            id='ano-dropdown',
-            options=[],  # Será populado dinamicamente
-            value=None,  # Será populado dinamicamente  
-            placeholder='Filtrar por Ano',
-            style={'width': '100%', 'marginTop': 24}
-        )
-    ], xs=12, md=1, className='my-2'),
+    ], xs=12, md=4, className='my-2'),
 ], className='mb-4')
-
-# # Indicadores principais
-# indicadores = dbc.Row([
-#     dbc.Col(dbc.Card([dbc.CardBody([
-#         html.H6('Total de Ligações', className='card-title'),
-#         html.H2(id='total-ligacoes', className='card-text')
-#     ])]), xs=12, md=4, className='my-2'),
-#     dbc.Col(dbc.Card([dbc.CardBody([
-#         html.H6('Atendidas', className='card-title'),
-#         html.H2(id='total-atendidas', className='card-text')
-#     ])]), xs=12, md=4, className='my-2'),
-#     dbc.Col(dbc.Card([dbc.CardBody([
-#         html.H6('Não Atendidas', className='card-title'),
-#         html.H2(id='total-nao-atendidas', className='card-text')
-#     ])]), xs=12, md=4, className='my-2'),
-# ], className='mb-3')
-
-# # Indicadores avançados
-# indicadores_avancados = dbc.Row([
-#     dbc.Col(dbc.Card([dbc.CardBody([
-#         html.H6('Taxa de Atendimento', className='card-title'),
-#         html.H2(id='taxa-atendimento', className='card-text')
-#     ])]), xs=12, md=4, className='my-2'),
-#     dbc.Col(dbc.Card([dbc.CardBody([
-#         html.H6('Duração Média (s) - Atendidas', className='card-title'),
-#         html.H2(id='duracao-media', className='card-text')
-#     ])]), xs=12, md=4, className='my-2'),
-#     dbc.Col(dbc.Card([dbc.CardBody([
-#         html.H6('Total de Tempo Falado/dia', className='card-title'),
-#         html.H2(id='total-segundos-dia', className='card-text')
-#     ])]), xs=12, md=4, className='my-2'),
-# ], className='mb-4')
-
-# # Gráficos
-# graficos = dbc.Row([
-#     dbc.Col(dcc.Graph(id='grafico-linha-dia', className='my-2'), xs=12, md=6, className='my-2'),
-#     dbc.Col(dcc.Graph(id='grafico-barra-faixa', className='my-2'), xs=12, md=6, className='my-2'),
-# ], className='mb-4')
-
-# graficos2 = dbc.Row([
-#     dbc.Col(dcc.Graph(id='heatmap-hora-dia', className='my-2'), xs=12, md=6, className='my-2'),
-#     dbc.Col(dcc.Graph(id='grafico-comparativo-tipo-dia', className='my-2'), xs=12, md=6, className='my-2'),
-# ], className='mb-4')
 
 # Indicadores principais com status da API
 indicadores = dbc.Row([
@@ -533,8 +436,8 @@ indicadores_avancados = dbc.Row([
         html.H2(id='duracao-media', className='card-text')
     ])]), xs=12, md=4, className='my-2'),
     dbc.Col(dbc.Card([dbc.CardBody([
-        html.H6('Tempo Médio de Espera', className='card-title'),
-        html.H2(id='tempo-espera-medio', className='card-text')
+        html.H6('Total de Tempo Falado', className='card-title'),
+        html.H2(id='total-tempo-falado', className='card-text')
     ])]), xs=12, md=4, className='my-2'),
 ], className='mb-4')
 
@@ -586,21 +489,6 @@ graficos5 = dbc.Row([
 
 # Layout
 app.layout = dbc.Container([
-        # Header com status
-        dbc.Row([
-            dbc.Col([
-                html.Div([
-                    html.H1([
-                        html.I(className="fas fa-phone-alt me-3", style={'color': '#28a745'}),
-                        "Dashboard - Centrais Telefônicas CBMMG"
-                    ], className='text-white mb-2'),
-                    html.P("Monitoramento em tempo real das chamadas telefônicas", 
-                          className='text-white-50 mb-2'),
-                    html.Div(id="status-info", className="mt-2")
-                ], className='text-center py-4')
-            ])
-        ], className='mb-4'),
-        
         filtros,
         filtros2,
         indicadores,
@@ -612,25 +500,16 @@ app.layout = dbc.Container([
         graficos4,
         graficos5,
         
-        # Componente de intervalo para atualizações
-        dcc.Interval(
-            id='interval-component',
-            interval=30*1000,  # Atualiza a cada 30 segundos
-            n_intervals=0
-        ),
-        
         html.Footer([
             html.Hr(),
-        html.P('Desenvolvido para o Corpo de Bombeiros Militar de Minas Gerais', style={'textAlign': 'center', 'color': '#fff'})
-    ], className='footer')
+            html.P('Desenvolvido para o Corpo de Bombeiros Militar de Minas Gerais', style={'textAlign': 'center', 'color': '#fff'})
+        ], className='footer')
 ], fluid=True, id='main-container')
 
 # Função para obter status dos dados
 def obter_status_dados():
-    """
-    Retorna o status atual dos dados (Banco, Cache, API)
-    """
-    global _cache_dados, INITIAL_LOAD_COMPLETE
+    """Retorna o status atual dos dados do banco"""
+    global INITIAL_LOAD_COMPLETE
     
     if not INITIAL_LOAD_COMPLETE:
         return html.Span([
@@ -638,31 +517,25 @@ def obter_status_dados():
             "Carregando dados..."
         ], style={'fontSize': '14px'})
     
-    if _cache_dados['timestamp'] is None:
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.execute("SELECT COUNT(*) FROM chamadas")
+            total_registros = cursor.fetchone()[0]
+            
+            # Obter data da última atualização do banco
+            cursor = conn.execute("SELECT MAX(created_at) FROM chamadas")
+            ultima_atualizacao = cursor.fetchone()[0]
+        
+        return html.Span([
+            html.I(className="fas fa-database", style={'color': '#28a745', 'marginRight': '5px'}),
+            f"{total_registros:,} registros",
+            html.Br(),
+            html.Small("Dados do banco local", style={'color': 'gray'})
+        ], style={'fontSize': '14px'})
+    except:
         return html.Span([
             html.I(className="fas fa-database", style={'color': '#17a2b8', 'marginRight': '5px'}),
-            "Dados do banco"
-        ], style={'fontSize': '14px'})
-    
-    agora = time_module.time()
-    tempo_desde_update = agora - _cache_dados['timestamp']
-    
-    if tempo_desde_update < CACHE_TIMEOUT:
-        # Cache válido
-        minutos_restantes = (CACHE_TIMEOUT - tempo_desde_update) / 60
-        return html.Span([
-            html.I(className="fas fa-check-circle", style={'color': '#28a745', 'marginRight': '5px'}),
-            f"Dados atuais",
-            html.Br(),
-            html.Small(f"Próxima sync em {minutos_restantes:.1f}min", style={'color': 'gray'})
-        ], style={'fontSize': '14px'})
-    else:
-        # Cache expirado - usando dados do banco
-        return html.Span([
-            html.I(className="fas fa-database", style={'color': '#17a2b8', 'marginRight': '5px'}),
-            "Dados do banco",
-            html.Br(),
-            html.Small("Aguardando próxima sync", style={'color': 'gray'})
+            "Banco de dados"
         ], style={'fontSize': '14px'})
 
 # Função para converter segundos em formato legível
@@ -678,7 +551,7 @@ def segundos_legiveis(segundos):
     m = minutos % 60
     return f"{horas}h {m}min {s}s" if s else (f"{horas}h {m}min" if m else f"{horas}h")
 
-# Callback
+# Callback principal
 @app.callback(
     [
         Output('total-ligacoes', 'children'),
@@ -687,7 +560,7 @@ def segundos_legiveis(segundos):
         Output('status-api', 'children'),
         Output('taxa-atendimento', 'children'),
         Output('duracao-media', 'children'),
-        Output('tempo-espera-medio', 'children'),
+        Output('total-tempo-falado', 'children'),
         Output('indicadores-cob-container', 'children'),
         Output('grafico-chamadas-data-cob', 'figure'),
         Output('grafico-atendidas-nao-atendidas', 'figure'),
@@ -706,13 +579,12 @@ def segundos_legiveis(segundos):
         Input('hh-fim', 'value'),
         Input('mm-fim', 'value'),
         Input('cob-dropdown', 'value'),
-        Input('ano-dropdown', 'value'),
         Input('toggle-legenda', 'value'),
     ]
 )
-def atualizar_dashboard(date_ini, hh_ini, mm_ini, date_fim, hh_fim, mm_fim, destinos, ano_selecionado, mostrar_legenda):
-    # Usar dados em cache (não recarregar a cada interação)
-    df_atual = carregar_dados_api()
+def atualizar_dashboard(date_ini, hh_ini, mm_ini, date_fim, hh_fim, mm_fim, destinos, mostrar_legenda):
+    # Carregar dados do cache/banco
+    df_atual = carregar_dados()
     
     # Obter status dos dados
     status_texto = obter_status_dados()
@@ -720,7 +592,7 @@ def atualizar_dashboard(date_ini, hh_ini, mm_ini, date_fim, hh_fim, mm_fim, dest
     if df_atual is None or df_atual.empty:
         print("Dados não encontrados ou vazios")
         return [
-            0, 0, 0, status_texto, "0%", "0 min", "0 min", [], 
+            0, 0, 0, status_texto, "0%", "0s", "0s", [], 
             {}, {}, {}, {}, {}, {}, {}, {}
         ]
     
@@ -771,8 +643,10 @@ def atualizar_dashboard(date_ini, hh_ini, mm_ini, date_fim, hh_fim, mm_fim, dest
             mm_fim = 59
     except:
         mm_fim = 59
+    
     hora_ini = f'{hh_ini:02d}:{mm_ini:02d}'
     hora_fim = f'{hh_fim:02d}:{mm_fim:02d}'
+    
     # Combinar data e hora
     try:
         datahora_ini = datetime.strptime(f"{date_ini} {hora_ini}", "%Y-%m-%d %H:%M")
@@ -785,12 +659,10 @@ def atualizar_dashboard(date_ini, hh_ini, mm_ini, date_fim, hh_fim, mm_fim, dest
 
     # Filtrar dados
     if not df_atual.empty:
-        # Garantir que a coluna datetime existe e é do tipo correto
         if 'datetime' not in df_atual.columns:
             print("❌ Coluna 'datetime' não encontrada no DataFrame")
             dff = pd.DataFrame()
         else:
-            # Verificar se a coluna datetime já está no formato correto
             if not pd.api.types.is_datetime64_any_dtype(df_atual['datetime']):
                 df_atual['datetime'] = pd.to_datetime(df_atual['datetime'], errors='coerce')
                 df_atual = df_atual.dropna(subset=['datetime'])
@@ -798,11 +670,6 @@ def atualizar_dashboard(date_ini, hh_ini, mm_ini, date_fim, hh_fim, mm_fim, dest
             if not df_atual.empty:
                 dff = df_atual[(df_atual['datetime'] >= datahora_ini) & (df_atual['datetime'] <= datahora_fim)]
                 
-                # Filtrar por ano se selecionado
-                if ano_selecionado:
-                    dff = dff[dff['data'].dt.year == ano_selecionado]
-                
-                # Filtrar por COB se selecionado
                 if destinos:
                     dff = dff[dff['cob'].isin(destinos)]
             else:
@@ -824,8 +691,8 @@ def atualizar_dashboard(date_ini, hh_ini, mm_ini, date_fim, hh_fim, mm_fim, dest
         ligacoes_atendidas = dff[dff['estado'] == 1]
         duracao_media = ligacoes_atendidas['duracao'].mean() if not ligacoes_atendidas.empty else 0
         
-        # Tempo médio de espera para todas as ligações
-        tempo_espera_medio = dff['holdtime'].mean()
+        # Total de tempo falado (soma de todas as durações de ligações atendidas)
+        total_tempo_falado = ligacoes_atendidas['duracao'].sum() if not ligacoes_atendidas.empty else 0
         
         # Formatação dos valores
         total_ligacoes_str = f"{total_ligacoes:,}"
@@ -833,7 +700,7 @@ def atualizar_dashboard(date_ini, hh_ini, mm_ini, date_fim, hh_fim, mm_fim, dest
         total_nao_atendidas_str = f"{total_nao_atendidas:,}"
         taxa_atendimento_str = f"{taxa_atendimento:.1f}%"
         duracao_media_str = segundos_legiveis(duracao_media)
-        tempo_espera_medio_str = segundos_legiveis(tempo_espera_medio)
+        total_tempo_falado_str = segundos_legiveis(total_tempo_falado)
         
         # Calcular indicadores por COB
         indicadores_cob_cards = []
@@ -853,8 +720,8 @@ def atualizar_dashboard(date_ini, hh_ini, mm_ini, date_fim, hh_fim, mm_fim, dest
                 atendidas_dados = dados_cob[dados_cob['estado'] == 1]
                 duracao_cob = atendidas_dados['duracao'].mean() if not atendidas_dados.empty else 0
                 
-                # Tempo médio de espera
-                espera_cob = dados_cob['holdtime'].mean()
+                # Total de tempo falado
+                total_tempo_cob = atendidas_dados['duracao'].sum() if not atendidas_dados.empty else 0
                 
                 # Card para este COB
                 card_cob = dbc.Col([
@@ -886,8 +753,8 @@ def atualizar_dashboard(date_ini, hh_ini, mm_ini, date_fim, hh_fim, mm_fim, dest
                                     html.H6(segundos_legiveis(duracao_cob), style={'color': '#636EFA'})
                                 ], xs=4),
                                 dbc.Col([
-                                    html.Small('Esp. Média', className='text-muted'),
-                                    html.H6(segundos_legiveis(espera_cob), style={'color': '#AB63FA'})
+                                    html.Small('Tempo Total', className='text-muted'),
+                                    html.H6(segundos_legiveis(total_tempo_cob), style={'color': '#AB63FA'})
                                 ], xs=4),
                             ])
                         ])
@@ -909,7 +776,7 @@ def atualizar_dashboard(date_ini, hh_ini, mm_ini, date_fim, hh_fim, mm_fim, dest
         total_nao_atendidas_str = "0"
         taxa_atendimento_str = "0.0%"
         duracao_media_str = "0s"
-        tempo_espera_medio_str = "0s"
+        total_tempo_falado_str = "0s"
         indicadores_cob_layout = html.Div("Nenhum dado disponível", 
                                         style={'textAlign': 'center', 'color': '#fff', 'padding': '20px'})
 
@@ -948,10 +815,9 @@ def atualizar_dashboard(date_ini, hh_ini, mm_ini, date_fim, hh_fim, mm_fim, dest
                 color='cob_nome',
                 title='Quantidade de Chamadas por Data e COB',
                 template='plotly',
-                barmode='stack'  # Barras empilhadas
+                barmode='stack'
             )
             
-            # Customizar aparência
             fig_chamadas.update_traces(
                 marker_line_width=1,
                 marker_line_color='rgba(255,255,255,0.5)'
@@ -965,9 +831,9 @@ def atualizar_dashboard(date_ini, hh_ini, mm_ini, date_fim, hh_fim, mm_fim, dest
                 title_font_size=16,
                 margin=dict(l=0, r=0, t=40, b=0),
                 legend_title_text='COB',
-                hovermode='closest',  # Hover apenas no elemento específico
-                bargap=0.2,  # Espaço entre barras
-                showlegend=mostrar_legenda  # Controla a visibilidade da legenda
+                hovermode='closest',
+                bargap=0.2,
+                showlegend=mostrar_legenda
             )
         else:
             fig_chamadas = grafico_vazio('Quantidade de Chamadas por Data e COB')
@@ -1017,7 +883,7 @@ def atualizar_dashboard(date_ini, hh_ini, mm_ini, date_fim, hh_fim, mm_fim, dest
                 title='Quantidade de Chamadas por Faixa Horária e Região (COB)',
                 labels={'quantidade': 'Número de Chamadas', 'faixa_horaria': 'Faixa Horária', 'cob_nome': 'Região (COB)'},
                 template='plotly',
-                color_discrete_sequence=['#636EFA', '#FF0000', '#00CC96', '#AB63FA', '#FFA15A', '#19D3F3', '#FFFF00', '#B6E880']
+                color_discrete_sequence=['#636EFA', '#FF0000', '#00CC96', '#AB63FA', '#FFA15A', '#19D3F3', '#FFFF00', '#B6E880', '#EF553B']
             )
             
             fig_faixa.update_layout(
@@ -1047,7 +913,7 @@ def atualizar_dashboard(date_ini, hh_ini, mm_ini, date_fim, hh_fim, mm_fim, dest
                 title='Quantidade de Chamadas por Faixa Horária e Região (COB) - Linha',
                 labels={'faixa_horaria': 'Faixa Horária', 'quantidade': 'Número de Chamadas', 'cob_nome': 'Região (COB)'},
                 template='plotly',
-                color_discrete_sequence=['#636EFA', '#FF0000', '#00CC96', '#AB63FA', '#FFA15A', '#19D3F3', '#FFFF00', '#B6E880'],
+                color_discrete_sequence=['#636EFA', '#FF0000', '#00CC96', '#AB63FA', '#FFA15A', '#19D3F3', '#FFFF00', '#B6E880', '#EF553B'],
                 markers=True
             )
             
@@ -1078,7 +944,7 @@ def atualizar_dashboard(date_ini, hh_ini, mm_ini, date_fim, hh_fim, mm_fim, dest
                 hole=0.4,
                 textinfo='label+percent',
                 textposition='outside',
-                marker=dict(colors=['#636EFA', '#FF0000', '#00CC96', '#AB63FA', '#FFA15A', '#19D3F3', '#FFFF00', '#B6E880'])
+                marker=dict(colors=['#636EFA', '#FF0000', '#00CC96', '#AB63FA', '#FFA15A', '#19D3F3', '#FFFF00', '#B6E880', '#EF553B'])
             )])
             
             fig_pizza.update_layout(
@@ -1105,9 +971,7 @@ def atualizar_dashboard(date_ini, hh_ini, mm_ini, date_fim, hh_fim, mm_fim, dest
             if not atendimentos_por_atendente.empty:
                 top_atendente = atendimentos_por_atendente.loc[atendimentos_por_atendente['atendimentos'].idxmax()]
                 media_atendimentos = atendimentos_por_atendente['atendimentos'].mean()
-                delta = top_atendente['atendimentos'] - media_atendimentos
                 
-                # Buscar o COB do top atendente
                 cob_top_atendente = chamadas_atendidas[chamadas_atendidas['teleatendente'] == top_atendente['teleatendente']]['cob_nome'].iloc[0]
                 
                 fig_indicador = go.Figure(go.Indicator(
@@ -1208,74 +1072,12 @@ def atualizar_dashboard(date_ini, hh_ini, mm_ini, date_fim, hh_fim, mm_fim, dest
     return (
         total_ligacoes_str, total_atendidas_str, total_nao_atendidas_str,
         status_texto,
-        taxa_atendimento_str, duracao_media_str, tempo_espera_medio_str,
+        taxa_atendimento_str, duracao_media_str, total_tempo_falado_str,
         indicadores_cob_layout,
         fig_chamadas, fig_atendidas, fig_faixa, fig_linha_faixa, 
         fig_pizza, fig_indicador, fig_top_cob_atendidas, fig_top_cob_nao_atendidas
     )
 
-# Callback para status da sincronização
-@app.callback(
-    Output('status-info', 'children'),
-    Input('interval-component', 'n_intervals')
-)
-def atualizar_status_sincronizacao(n):
-    """Atualiza o status da sincronização de dados"""
-    global _cache_dados, INITIAL_LOAD_COMPLETE
-    
-    status_elements = []
-    
-    # Status da carga inicial
-    if INITIAL_LOAD_COMPLETE:
-        status_elements.append(
-            html.Span([
-                html.I(className="fas fa-check-circle", style={'color': '#28a745', 'marginRight': '5px'}),
-                "Banco inicializado"
-            ], className="badge badge-success me-2")
-        )
-    else:
-        status_elements.append(
-            html.Span([
-                html.I(className="fas fa-clock", style={'color': '#ffc107', 'marginRight': '5px'}),
-                "Carregando dados..."
-            ], className="badge badge-warning me-2")
-        )
-    
-    # Status da última sincronização
-    if _cache_dados.get('last_sync'):
-        tempo_desde_sync = datetime.now() - _cache_dados['last_sync']
-        minutos_desde_sync = tempo_desde_sync.total_seconds() / 60
-        
-        if minutos_desde_sync < SYNC_INTERVAL_MINUTES:
-            cor = '#28a745'
-            icone = 'fas fa-sync-alt'
-        else:
-            cor = '#ffc107'
-            icone = 'fas fa-exclamation-triangle'
-        
-        status_elements.append(
-            html.Span([
-                html.I(className=icone, style={'color': cor, 'marginRight': '5px'}),
-                f"Última sync: {minutos_desde_sync:.0f}min atrás"
-            ], className="badge badge-info me-2")
-        )
-    
-    # Total de registros no banco
-    try:
-        with get_db_connection() as conn:
-            cursor = conn.execute("SELECT COUNT(*) FROM chamadas")
-            total_registros = cursor.fetchone()[0]
-        
-        status_elements.append(
-            html.Span([
-                html.I(className="fas fa-database", style={'color': '#17a2b8', 'marginRight': '5px'}),
-                f"{total_registros:,} registros"
-            ], className="badge badge-info")
-        )
-    except:
-        pass
-    
-    return html.Div(status_elements, className="d-flex justify-content-center flex-wrap")
 
 # Callback para popular o dropdown de COB dinamicamente
 @app.callback(
@@ -1285,7 +1087,7 @@ def atualizar_status_sincronizacao(n):
 )
 def popular_dropdown_cob(_):
     """Popula o dropdown de COB com os dados disponíveis"""
-    df_atual = carregar_dados_api()
+    df_atual = carregar_dados_banco()
     
     if not df_atual.empty and 'cob' in df_atual.columns:
         # Remover valores nulos e obter valores únicos
@@ -1306,39 +1108,6 @@ def popular_dropdown_cob(_):
         print("⚠️ Nenhum COB encontrado para popular dropdown")
         return [], []
 
-# Callback para popular o dropdown de ano dinamicamente
-@app.callback(
-    [Output('ano-dropdown', 'options'),
-     Output('ano-dropdown', 'value')],
-    [Input('ano-dropdown', 'id')]  # Trigger na inicialização
-)
-def popular_dropdown_ano(_):
-    """Popula o dropdown de ano com os dados disponíveis"""
-    df_atual = carregar_dados_api()
-    
-    if not df_atual.empty and 'data' in df_atual.columns:
-        # Garantir que a coluna data é datetime
-        if not pd.api.types.is_datetime64_any_dtype(df_atual['data']):
-            df_atual['data'] = pd.to_datetime(df_atual['data'], errors='coerce')
-        
-        # Extrair anos únicos dos dados
-        anos_unicos = df_atual['data'].dt.year.dropna().unique()
-        anos_ordenados = sorted(anos_unicos, reverse=True)  # Mais recentes primeiro
-        
-        # Criar opções do dropdown
-        opcoes = [{'label': str(ano), 'value': ano} for ano in anos_ordenados]
-        
-        # Valor padrão: ano atual se disponível, senão o mais recente
-        ano_atual = datetime.now().year
-        valor_padrao = ano_atual if ano_atual in anos_ordenados else anos_ordenados[0] if anos_ordenados else None
-        
-        print(f"📅 Anos encontrados para dropdown: {list(anos_ordenados)}")
-        print(f"📅 Ano padrão selecionado: {valor_padrao}")
-        
-        return opcoes, valor_padrao
-    else:
-        print("⚠️ Nenhum ano encontrado para popular dropdown")
-        return [], None
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8050))
